@@ -4,25 +4,20 @@ Kafka consumer: full pipeline example.
 
 Reads sales messages from a Kafka topic and runs the full pipeline:
   - Validates each message against the data contract
-  - Computes derived fields (subtotal, tax amount, total)
-  - Stores each message in a DuckDB database
+  - Computes derived fields such as subtotal, tax amount, and total
+  - Adds custom analytics fields for a new business problem
+  - Stores accepted and rejected messages in DuckDB
+  - Writes accepted messages to a CSV artifact
 
-Start with main() at the bottom.
-Work up to see how it all fits together.
+Technical Modification:
+- Adds product category enrichment from products.csv
+- Adds high-value order flag
+- Adds order size band
+- Tracks running sales total by region
+- Stores rejected consumed messages in DuckDB
 
-Many functions are standard helpers
-and should not need project-specific modifications.
-
-# In this example, we open, write, and close the DuckDB database
-# for each accepted message. This makes each message visible in
-# the database immediately, even if the consumer is stopped early.
-#
-# In production, a long-running consumer might keep the database
-# connection open longer and commit work in batches for efficiency.
-
-# Stream processing engines like Spark Structured Streaming or Flink
-# are designed to manage resources and state
-# and are excellent additions to this type of pipeline for production use.
+New Problem:
+- Real-time sales quality and revenue monitoring
 
 Author: O S
 Date: 2026-06-06
@@ -30,10 +25,6 @@ Date: 2026-06-06
 Terminal command to run this file from the root project folder:
 
     uv run python -m streaming.kafka_consumer_femi
-
-OBS:
-  Don't edit this file - it should remain a working example.
-  Copy it, rename it consumer_yourname.py, and modify your copy.
 """
 
 # === DECLARE IMPORTS ===
@@ -66,7 +57,12 @@ from streaming.data_validation.data_contract_femi import (
     SALES_REQUIRED_FIELDS,
     validate_required_fields,
 )
-from streaming.storage.storage_femi import init_db, write_valid_record
+from streaming.storage.storage_femi import (
+    init_db,
+    log_storage_summary,
+    write_rejected_record,
+    write_valid_record,
+)
 
 # === CONFIGURE LOGGER ===
 
@@ -82,6 +78,7 @@ log_env_vars(LOG)
 COURSE_NAME: Final[str] = "Streaming Data"
 TIMEOUT_SECONDS: Final[float] = float(os.getenv("CONSUMER_TIMEOUT_SECONDS", "10.0"))
 MAX_MESSAGES: Final[int] = int(os.getenv("CONSUMER_MAX_MESSAGES", "1000"))
+HIGH_VALUE_TOTAL: Final[float] = float(os.getenv("HIGH_VALUE_TOTAL", "250.0"))
 
 # === DECLARE CONSTANT PATHS ===
 
@@ -89,8 +86,8 @@ ROOT_DIR: Final[Path] = Path.cwd()
 DATA_DIR: Final[Path] = ROOT_DIR / "data"
 OUTPUT_DIR: Final[Path] = DATA_DIR / "output"
 
-OUTPUT_CSV: Final[Path] = OUTPUT_DIR / "consumed_sales.csv"
-OUTPUT_DB: Final[Path] = OUTPUT_DIR / "sales.duckdb"
+OUTPUT_CSV: Final[Path] = OUTPUT_DIR / "consumed_sales_femi.csv"
+OUTPUT_DB: Final[Path] = OUTPUT_DIR / "sales_femi.duckdb"
 
 REGIONS_CSV: Final[Path] = DATA_DIR / "regions.csv"
 PRODUCTS_CSV: Final[Path] = DATA_DIR / "products.csv"
@@ -109,6 +106,7 @@ def log_paths() -> None:
     LOG.info("========================")
     LOG.info("START consumer main()")
     LOG.info("========================")
+    LOG.info("Project: %s", COURSE_NAME)
     log_path(LOG, "ROOT_DIR", ROOT_DIR)
     log_path(LOG, "DATA_DIR", DATA_DIR)
     log_path(LOG, "OUTPUT_CSV", OUTPUT_CSV)
@@ -132,6 +130,7 @@ def load_settings() -> KafkaSettings:
     LOG.info(f"KAFKA_GROUP_ID           = {settings.group_id}")
     LOG.info(f"CONSUMER_TIMEOUT_SECONDS = {TIMEOUT_SECONDS}")
     LOG.info(f"CONSUMER_MAX_MESSAGES    = {MAX_MESSAGES}")
+    LOG.info(f"HIGH_VALUE_TOTAL         = {HIGH_VALUE_TOTAL}")
     return settings
 
 
@@ -142,6 +141,7 @@ def verify_connection(settings: KafkaSettings) -> None:
         SystemExit: If Kafka is not reachable.
     """
     LOG.info("Verifying Kafka connection...")
+
     try:
         verify_kafka_connection(settings)
         LOG.info("Kafka port is reachable.")
@@ -151,7 +151,7 @@ def verify_connection(settings: KafkaSettings) -> None:
 
 
 def verify_topic(settings: KafkaSettings) -> None:
-    """Verify the topic exists and has messages.
+    """Verify the Kafka topic exists and has messages.
 
     Raises:
         SystemExit: If the topic does not exist or is empty.
@@ -183,6 +183,7 @@ def get_kafka_consumer(settings: KafkaSettings) -> Any:
     """
     LOG.info("Creating Kafka consumer...")
     consumer = create_consumer(settings)
+
     consumer.subscribe(
         [settings.topic],
         on_assign=lambda c, partitions: c.assign(
@@ -196,6 +197,7 @@ def get_kafka_consumer(settings: KafkaSettings) -> Any:
             ]
         ),
     )
+
     LOG.info(f"Subscribed to topic: {settings.topic!r} (reading from beginning)")
     return consumer
 
@@ -216,6 +218,7 @@ def initialize_output() -> RunningStats:
 
     if OUTPUT_CSV.exists():
         OUTPUT_CSV.unlink()
+
     LOG.info(f"Output CSV cleared: {OUTPUT_CSV.name}")
 
     init_db(OUTPUT_DB)
@@ -224,80 +227,146 @@ def initialize_output() -> RunningStats:
     return RunningStats()
 
 
-def load_reference_data() -> dict[str, float]:
+def load_reference_data() -> tuple[dict[str, float], dict[str, str]]:
     """Load reference data used for message enrichment.
 
     Returns:
-        A dictionary mapping region_id to tax rate as a float.
+        A tuple containing:
+        - region tax rate lookup
+        - product category lookup
     """
     LOG.info("Loading enrichment reference data...")
-    region_lookup: dict[str, float] = {
-        region_id: float(tax_rate_pct)
-        for region_id, tax_rate_pct in read_csv_as_lookup(
-            REGIONS_CSV,
-            key_field="region_id",
-            value_field="tax_rate_pct",
-        ).items()
-    }
+
+    region_rows = read_csv_as_lookup(
+        REGIONS_CSV,
+        key_field="region_id",
+        value_field="tax_rate_pct",
+    )
+
+    region_lookup: dict[str, float] = {}
+
+    for region_id, tax_rate_pct in region_rows.items():
+        region_lookup[str(region_id)] = float(tax_rate_pct)
+
+    product_rows = read_csv_as_lookup(
+        PRODUCTS_CSV,
+        key_field="product_id",
+        value_field="category",
+    )
+
+    product_category_lookup: dict[str, str] = {}
+
+    for product_id, category in product_rows.items():
+        product_category_lookup[str(product_id)] = str(category)
+
     LOG.info(f"Found {len(region_lookup)} region tax rates.")
-    return region_lookup
+    LOG.info(f"Found {len(product_category_lookup)} product categories.")
+
+    return region_lookup, product_category_lookup
 
 
 def process_message(
     row: dict[str, Any],
     *,
     region_lookup: dict[str, float],
+    product_category_lookup: dict[str, str],
     stats: RunningStats,
-) -> dict[str, Any] | None:
+    region_sales_totals: dict[str, float],
+) -> tuple[dict[str, Any] | None, list[str]]:
     """Process one consumed message.
 
     Steps:
       - Validate required fields
-      - Enrich with derived fields
-      - Update running statistics
+      - Enrich with subtotal, tax amount, and total
+      - Add product category
+      - Add high-value order flag
+      - Add order size band
+      - Track running sales total by region
 
-    Arguments:
+    Args:
         row: A raw consumed Kafka message row.
         region_lookup: Tax rates by region_id.
+        product_category_lookup: Product category by product_id.
         stats: Running statistics accumulator.
+        region_sales_totals: Running sales totals by region_id.
 
     Returns:
-        The enriched row, or None if validation failed.
+        A tuple of enriched row and validation errors.
+        If the message is invalid, enriched row is None.
     """
     errors = validate_required_fields(record=row, required_fields=SALES_REQUIRED_FIELDS)
+
     if errors:
         LOG.warning(f"Validation failed for order {row.get('order_id', '?')}")
         LOG.warning(f"errors={errors}")
-        return None
+        return None, errors
 
-    enriched = enrich_message(row, region_lookup)
+    try:
+        enriched = enrich_message(row, region_lookup)
+
+        total = float(enriched["total"])
+        region_id = str(enriched["region_id"])
+        product_id = str(enriched["product_id"])
+
+        product_category = product_category_lookup.get(product_id, "unknown")
+        enriched["product_category"] = product_category
+
+        if total >= HIGH_VALUE_TOTAL:
+            enriched["high_value_order"] = "yes"
+        else:
+            enriched["high_value_order"] = "no"
+
+        if total >= 250:
+            enriched["order_size_band"] = "high"
+        elif total >= 100:
+            enriched["order_size_band"] = "medium"
+        else:
+            enriched["order_size_band"] = "low"
+
+        previous_region_total = region_sales_totals.get(region_id, 0.0)
+        new_region_total = previous_region_total + total
+        region_sales_totals[region_id] = new_region_total
+        enriched["region_running_total"] = round(new_region_total, 2)
+
+    except (KeyError, TypeError, ValueError) as error:
+        error_message = f"Processing failed: {error}"
+        LOG.warning(error_message)
+        return None, [error_message]
+
     LOG.info(f"subtotal={enriched['subtotal']}")
     LOG.info(f"tax={enriched['tax_amount']}")
     LOG.info(f"total={enriched['total']}")
-    LOG.info(f"running_total={stats.total + enriched['total']:.2f}")
+    LOG.info(f"product_category={enriched['product_category']}")
+    LOG.info(f"order_size_band={enriched['order_size_band']}")
+    LOG.info(f"high_value_order={enriched['high_value_order']}")
+    LOG.info(f"region_running_total={enriched['region_running_total']}")
+    LOG.info(f"running_total={stats.total + total:.2f}")
 
-    stats.update(enriched["total"])
+    stats.update(total)
 
-    return enriched
+    return enriched, []
 
 
 def consume_messages(
-    consumer: Any, *, region_lookup: dict[str, float], stats: RunningStats
+    consumer: Any,
+    *,
+    region_lookup: dict[str, float],
+    product_category_lookup: dict[str, str],
+    stats: RunningStats,
 ) -> tuple[int, int]:
     """Consume and process messages from the Kafka topic.
 
     Runs until MAX_MESSAGES is reached or TIMEOUT_SECONDS elapses
     with no new message.
 
-    All arguments after the asterisk must be passed as keyword arguments.
-
-    Arguments:
+    Args:
         consumer: An open Kafka consumer subscribed to the topic.
         region_lookup: Tax rates by region_id.
+        product_category_lookup: Product category by product_id.
         stats: Running statistics accumulator.
 
     Returns:
-        A tuple of (consumed_count, skipped_count).
+        A tuple of consumed_count and skipped_count.
     """
     LOG.info("Consuming messages...")
     LOG.info(f"Waiting for up to {MAX_MESSAGES} message(s).")
@@ -305,6 +374,7 @@ def consume_messages(
 
     consumed_count = 0
     skipped_count = 0
+    region_sales_totals: dict[str, float] = {}
 
     while consumed_count + skipped_count < MAX_MESSAGES:
         row = consume_kafka_message(
@@ -319,26 +389,33 @@ def consume_messages(
 
         LOG.info(row)
 
-        enriched = process_message(
+        enriched, errors = process_message(
             row,
             region_lookup=region_lookup,
+            product_category_lookup=product_category_lookup,
             stats=stats,
+            region_sales_totals=region_sales_totals,
         )
 
         if enriched is None:
             skipped_count += 1
+
+            write_rejected_record(
+                db_path=OUTPUT_DB,
+                record=row,
+                errors=errors,
+            )
+
             LOG.warning("MESSAGE REJECTED")
             LOG.warning(f"order={row.get('order_id', '?')}")
             LOG.warning(f"skipped={skipped_count}")
             continue
 
-        # NEW: Write the valid record to the DuckDB database
-        # using the helper function.
         write_valid_record(OUTPUT_DB, enriched)
+
         LOG.info("Wrote valid record to DuckDB:")
         LOG.info(f"  order={enriched['order_id']}")
 
-        # Also update the CSV as usual.
         append_csv_row(
             path=OUTPUT_CSV,
             row={field: enriched.get(field, "") for field in CONSUMED_FIELDNAMES},
@@ -346,10 +423,16 @@ def consume_messages(
         )
 
         consumed_count += 1
+
         LOG.info("MESSAGE ACCEPTED")
         LOG.info(f"order={enriched['order_id']}")
         LOG.info(f"total=${enriched['total']:.2f}")
+        LOG.info(f"category={enriched['product_category']}")
+        LOG.info(f"band={enriched['order_size_band']}")
+        LOG.info(f"high_value={enriched['high_value_order']}")
+        LOG.info(f"region_running_total={enriched['region_running_total']}")
         LOG.info(f"consumed={consumed_count}")
+
         LOG.info("RUNNING STATS")
         LOG.info(f"total_sales=${stats.total:,.2f}")
         LOG.info(f"average=${stats.mean:,.2f}")
@@ -360,10 +443,11 @@ def consume_messages(
 
 
 def save_artifacts() -> None:
-    """Save output artifacts or note their location."""
+    """Save output artifacts and log DuckDB summary results."""
     LOG.info("Saving artifacts...")
     log_path(LOG, "WROTE OUTPUT_CSV", OUTPUT_CSV)
     log_path(LOG, "WROTE OUTPUT_DB", OUTPUT_DB)
+    log_storage_summary(OUTPUT_DB)
 
 
 # ===========================================================================
@@ -377,11 +461,19 @@ def log_summary(
     stats: RunningStats,
     settings: KafkaSettings,
 ) -> None:
-    """Log final summary statistics."""
+    """Log final summary statistics.
+
+    Args:
+        consumed_count: Number of accepted messages.
+        skipped_count: Number of rejected messages.
+        stats: Running statistics accumulator.
+        settings: Kafka settings.
+    """
     LOG.info("Summary:")
     LOG.info(f"Consumed {consumed_count} message(s) from topic {settings.topic!r}.")
     LOG.info(f"Skipped  {skipped_count} message(s).")
     log_path(LOG, "OUTPUT_CSV", OUTPUT_CSV)
+    log_path(LOG, "OUTPUT_DB", OUTPUT_DB)
 
     if stats.count > 0:
         LOG.info(f"  Total sales:  ${stats.total:,.2f}")
@@ -417,7 +509,7 @@ def main() -> None:
     LOG.info("========================")
 
     stats = initialize_output()
-    region_lookup = load_reference_data()
+    region_lookup, product_category_lookup = load_reference_data()
 
     consumed_count = 0
     skipped_count = 0
@@ -426,6 +518,7 @@ def main() -> None:
         consumed_count, skipped_count = consume_messages(
             consumer,
             region_lookup=region_lookup,
+            product_category_lookup=product_category_lookup,
             stats=stats,
         )
     finally:
@@ -442,9 +535,6 @@ def main() -> None:
 
 
 # === CONDITIONAL EXECUTION GUARD ===
-
-# WHY: If running this file as a script, then call main().
-# This is standard Python "boilerplate".
 
 if __name__ == "__main__":
     main()

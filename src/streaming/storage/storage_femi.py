@@ -55,8 +55,8 @@ from datafun_toolkit.logger import get_logger
 import duckdb
 
 from streaming.data_validation.data_contract_femi import (
+    CONSUMED_FIELDNAMES,
     REJECTED_SALES_FIELDNAMES,
-    VALID_SALES_FIELDNAMES,
 )
 from streaming.data_validation.data_validation_femi import add_validation_errors
 
@@ -101,12 +101,7 @@ REJECTED_TABLE_NAME: Final[str] = "consumed_rejected_sales"
 # The offset is the unique identifier for the message in that partition
 # and useful for tracking consumption progress and debugging.
 
-CONSUMED_VALID_FIELDNAMES: Final[list[str]] = [
-    *VALID_SALES_FIELDNAMES,
-    "_kafka_key",
-    "_kafka_partition",
-    "_kafka_offset",
-]
+CONSUMED_VALID_FIELDNAMES: Final[list[str]] = CONSUMED_FIELDNAMES
 
 CONSUMED_REJECTED_FIELDNAMES: Final[list[str]] = [
     *REJECTED_SALES_FIELDNAMES,
@@ -294,52 +289,61 @@ def write_rejected_record(
 
 
 def log_storage_summary(db_path: Path) -> None:
-    """Log simple DuckDB query results after consuming messages.
-
-    Arguments:
-        db_path: Path to the DuckDB database file.
-
-    Returns:
-        None.
-    """
-    # Constructed SQL statements can be security risks for
-    # SQL injection if they include untrusted input.
-    # In this case, the table names are constants defined in this module,
-    # so they are not influenced by user input and are safe to use directly in SQL.
-    # We add the "no QA" annotation to tell security linters
-    # that we have reviewed this code and it is not vulnerable to SQL injection.
+    """Log DuckDB query results after consuming messages."""
     sql_valid_count = f"SELECT COUNT(*) FROM {VALID_TABLE_NAME}"  # noqa: S608
     sql_rejected_count = f"SELECT COUNT(*) FROM {REJECTED_TABLE_NAME}"  # noqa: S608
+
     sql_by_region = f"""
-        SELECT region_id, COUNT(*) AS sale_count
+        SELECT
+            region_id,
+            COUNT(*) AS sale_count,
+            ROUND(SUM(total), 2) AS total_sales
         FROM {VALID_TABLE_NAME}
         GROUP BY region_id
-        ORDER BY region_id
+        ORDER BY total_sales DESC
         """  # noqa: S608
 
-    # Open a connection to the DuckDB database.
-    with duckdb.connect(str(db_path)) as conn:
-        # use the connection to execute the SQL statements and fetch results.
-        valid_result = conn.execute(sql_valid_count).fetchone()
+    sql_by_category = f"""
+        SELECT
+            product_category,
+            COUNT(*) AS sale_count,
+            ROUND(SUM(total), 2) AS total_sales
+        FROM {VALID_TABLE_NAME}
+        GROUP BY product_category
+        ORDER BY total_sales DESC
+        """  # noqa: S608
 
-        # valid_result is a tuple like (42,) or None if the query returned no rows.
-        # So the count is either the first element of the tuple
-        # or 0 if there was no result.
+    sql_high_value = f"""
+        SELECT
+            high_value_order,
+            COUNT(*) AS order_count
+        FROM {VALID_TABLE_NAME}
+        GROUP BY high_value_order
+        ORDER BY order_count DESC
+        """  # noqa: S608
+
+    with duckdb.connect(str(db_path)) as conn:
+        valid_result = conn.execute(sql_valid_count).fetchone()
         valid_count = valid_result[0] if valid_result else 0
 
-        # Same thing for rejected messages
         rejected_result = conn.execute(sql_rejected_count).fetchone()
         rejected_count = rejected_result[0] if rejected_result else 0
 
-        # For the by-region query, we expect multiple rows, so we use fetchall() to get a list of tuples.
-        # The variable rows will be a list of tuples
-        # like [("US-MO", 10), ("US-CA", 5), ...]
-        # or an empty list if there are no valid records.
-        rows = conn.execute(sql_by_region).fetchall()
+        region_rows = conn.execute(sql_by_region).fetchall()
+        category_rows = conn.execute(sql_by_category).fetchall()
+        high_value_rows = conn.execute(sql_high_value).fetchall()
 
     LOG.info(f"DuckDB valid row(s): {valid_count}")
     LOG.info(f"DuckDB rejected row(s): {rejected_count}")
 
-    LOG.info("DuckDB valid sale count by region:")
-    for region_id, sale_count in rows:
-        LOG.info(f"  {region_id}: {sale_count}")
+    LOG.info("DuckDB sales by region:")
+    for region_id, sale_count, total_sales in region_rows:
+        LOG.info(f"  {region_id}: {sale_count} sale(s), total=${total_sales}")
+
+    LOG.info("DuckDB sales by product category:")
+    for product_category, sale_count, total_sales in category_rows:
+        LOG.info(f"  {product_category}: {sale_count} sale(s), total=${total_sales}")
+
+    LOG.info("DuckDB high-value order summary:")
+    for high_value_order, order_count in high_value_rows:
+        LOG.info(f"  {high_value_order}: {order_count}")

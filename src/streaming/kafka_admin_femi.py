@@ -1,4 +1,4 @@
-"""src/streaming/admin_femi.py - Kafka topic management example.
+"""src/streaming/kafka_admin_femi.py - Kafka topic management example.
 
 Creates, inspects, and optionally deletes Kafka topics.
 

@@ -89,7 +89,7 @@ OUTPUT_DIR: Final[Path] = DATA_DIR / "output"
 SALES_CSV: Final[Path] = DATA_DIR / "sales.csv"
 REGIONS_CSV: Final[Path] = DATA_DIR / "regions.csv"
 PRODUCTS_CSV: Final[Path] = DATA_DIR / "products.csv"
-REJECTED_SALES_CSV: Final[Path] = OUTPUT_DIR / "producer_rejected_sales.csv"
+REJECTED_SALES_CSV: Final[Path] = OUTPUT_DIR / "producer_rejected_sales_femi.csv"
 
 
 # ==========================================================
