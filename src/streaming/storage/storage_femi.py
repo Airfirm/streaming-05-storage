@@ -297,7 +297,7 @@ def log_storage_summary(db_path: Path) -> None:
         SELECT
             region_id,
             COUNT(*) AS sale_count,
-            ROUND(SUM(total), 2) AS total_sales
+            ROUND(SUM(CAST(total AS DOUBLE)), 2) AS total_sales
         FROM {VALID_TABLE_NAME}
         GROUP BY region_id
         ORDER BY total_sales DESC
@@ -307,7 +307,7 @@ def log_storage_summary(db_path: Path) -> None:
         SELECT
             product_category,
             COUNT(*) AS sale_count,
-            ROUND(SUM(total), 2) AS total_sales
+            ROUND(SUM(CAST(total AS DOUBLE)), 2) AS total_sales
         FROM {VALID_TABLE_NAME}
         GROUP BY product_category
         ORDER BY total_sales DESC
